@@ -1,0 +1,14 @@
+# NSE WhatsApp Alert Agent - Dependencies
+# Install: pip install -r requirements.txt
+
+# HTTP requests with session management
+requests>=2.31.0
+
+# Twilio SDK for WhatsApp messaging
+twilio>=9.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# AI Summarization (optional - works without it too)
+anthropic>=0.40.0

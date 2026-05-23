@@ -1,0 +1,64 @@
+name: 🔔 NSE WhatsApp Alert Monitor
+
+on:
+  # Run every 15 minutes during NSE hours (fits within GitHub free tier: ~1,560 min/month)
+  # GitHub cron uses UTC. IST 9:00 AM = UTC 3:30 AM, IST 11:30 PM = UTC 6:00 PM
+  schedule:
+    - cron: '*/15 3-18 * * 1-6'  # Every 15 min, Mon-Sat, 3AM-6PM UTC (8:30AM-11:30PM IST)
+
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Needed to commit the DB file back
+
+jobs:
+  check-nse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 📂 Restore alerts database
+        run: |
+          # Pull latest DB from the repo (if it exists)
+          if [ -f alerts.db ]; then
+            echo "✅ Existing alerts.db found"
+          else
+            echo "📝 No alerts.db yet — first run"
+          fi
+
+      - name: 🔔 Run NSE check cycle
+        env:
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          WHATSAPP_TO: ${{ secrets.WHATSAPP_TO }}
+          POLL_INTERVAL_SECONDS: '300'
+          LOG_LEVEL: 'INFO'
+        run: python run_once.py
+
+      - name: 💾 Save alerts database
+        run: |
+          git config user.name "NSE Alert Bot"
+          git config user.email "nse-alert-bot@github-actions"
+
+          # Only commit if DB changed
+          if git diff --quiet alerts.db 2>/dev/null && ! git ls-files --others --exclude-standard | grep -q alerts.db; then
+            echo "📭 No DB changes — skipping commit"
+          else
+            git add alerts.db
+            git commit -m "🔄 Update alerts database [skip ci]" || echo "Nothing to commit"
+            git push || echo "Push failed — will retry next run"
+          fi

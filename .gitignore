@@ -1,0 +1,32 @@
+# Environment and secrets
+.env
+*.env
+
+# Database — NOT ignored (GitHub Actions needs it for state persistence)
+# alerts.db
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local-only files (not needed in GitHub Actions)
+combined_certs.pem
+agent.pid
+.env.example
