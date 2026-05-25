@@ -82,21 +82,47 @@ def main():
         to_number=whatsapp_to,
     )
 
-    # Check each company
+    # Strategy: Fetch ALL announcements in one call, then filter by watchlist
+    # This is much more efficient (1 API call vs 48) and works better from cloud IPs
     new_alerts_sent = 0
     all_new = []
 
-    for company in companies:
-        symbol = company["symbol"]
-        try:
-            announcements = scraper.fetch_announcements_by_symbol(symbol)
-            for ann in announcements:
+    logger.info("📡 Fetching all NSE announcements (bulk strategy)...")
+    try:
+        all_announcements = scraper.fetch_all_recent_announcements()
+        if all_announcements:
+            matched = scraper.filter_by_watchlist(all_announcements, symbols)
+            for ann in matched:
                 if not db.is_already_sent(ann):
                     all_new.append(ann)
-            time.sleep(1)  # Rate limit
-        except Exception as e:
-            logger.error(f"❌ Error fetching {symbol}: {e}")
-            continue
+            logger.info(f"📊 Bulk: {len(all_announcements)} total → {len(matched)} matched → {len(all_new)} new")
+        else:
+            logger.warning("⚠️ Bulk fetch returned empty. Trying per-symbol fallback...")
+            # Fallback: fetch per-symbol (slower but more resilient)
+            for company in companies:
+                symbol = company["symbol"]
+                try:
+                    announcements = scraper.fetch_announcements_by_symbol(symbol)
+                    for ann in announcements:
+                        if not db.is_already_sent(ann):
+                            all_new.append(ann)
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"❌ Error fetching {symbol}: {e}")
+                    continue
+    except Exception as e:
+        logger.error(f"❌ Bulk fetch error: {e}. Trying per-symbol...")
+        for company in companies:
+            symbol = company["symbol"]
+            try:
+                announcements = scraper.fetch_announcements_by_symbol(symbol)
+                for ann in announcements:
+                    if not db.is_already_sent(ann):
+                        all_new.append(ann)
+                time.sleep(1)
+            except Exception as e2:
+                logger.error(f"❌ Error fetching {symbol}: {e2}")
+                continue
 
     if not all_new:
         logger.info(f"📭 No new announcements found at {datetime.now().strftime('%H:%M:%S IST')}")
