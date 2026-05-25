@@ -28,10 +28,7 @@ jobs:
           cache: 'pip'
 
       - name: 📦 Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install playwright
-          playwright install chromium --with-deps
+        run: pip install -r requirements.txt
 
       - name: 📂 Restore alerts database
         run: |

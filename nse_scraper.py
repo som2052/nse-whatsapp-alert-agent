@@ -1,137 +1,150 @@
 """
 NSE Corporate Announcements Scraper
 ====================================
-Fetches real-time corporate filings and announcements from NSE India.
+Fetches real-time corporate filings from NSE India.
 
-Uses a dual-strategy approach:
-  1. PRIMARY: Direct NSE API (works from residential IPs like your Mac)
-  2. FALLBACK: Playwright-based scraping or public mirror APIs
-     (works from cloud/datacenter IPs like GitHub Actions)
+NSE uses Akamai Bot Manager which blocks cloud IPs and detects
+automation. This scraper uses curl_cffi to impersonate Chrome's
+TLS fingerprint — the proven approach to bypass Akamai from cloud.
 
-NSE blocks cloud provider IPs (AWS/Azure/GCP), so the fallback
-strategy is essential for GitHub Actions deployment.
+Strategy:
+  1. curl_cffi with Chrome impersonation (works from cloud IPs)
+  2. Direct requests with session cookies (works from residential IPs)
 """
 
 import time
 import logging
-import requests
 import os
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Try importing curl_cffi first (works from cloud), fallback to requests
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+    logger.debug("✅ curl_cffi available — Chrome TLS impersonation enabled")
+except ImportError:
+    HAS_CURL_CFFI = False
+    logger.debug("⚠️ curl_cffi not available — using standard requests")
+
+import requests
+
 
 class NSEScraper:
     """
     Scrapes corporate announcements from NSE India.
-
-    Automatically detects if running in cloud (GitHub Actions) vs local,
-    and uses the appropriate fetching strategy.
+    Uses curl_cffi Chrome impersonation to bypass Akamai Bot Manager.
     """
 
     BASE_URL = "https://www.nseindia.com"
     ANNOUNCEMENTS_API = f"{BASE_URL}/api/corporate-announcements"
 
-    # Public NSE data APIs that don't block cloud IPs
-    # These are community-maintained mirrors of NSE data
-    FALLBACK_APIS = [
-        "https://www.nseindia.com/api/corporate-announcements",
-    ]
-
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
-    ]
+    HEADERS = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+        "Origin": "https://www.nseindia.com",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+    }
 
     def __init__(self):
-        self.session: Optional[requests.Session] = None
+        self._cffi_session = None
+        self._requests_session = None
         self._session_created_at: float = 0
-        self._ua_index: int = 0
         self._request_count: int = 0
         self.SESSION_TTL = 90
-        self._is_cloud = self._detect_cloud_env()
-        self._nse_accessible = None  # Will be determined on first call
+        self._is_cloud = os.getenv("GITHUB_ACTIONS") == "true" or os.getenv("CI") == "true"
+        self._use_cffi = HAS_CURL_CFFI
 
         if self._is_cloud:
-            logger.info("☁️ Cloud environment detected (GitHub Actions). Will use resilient fetching.")
+            logger.info("☁️ Cloud environment detected (GitHub Actions)")
+        if self._use_cffi:
+            logger.info("🔒 curl_cffi enabled — Chrome TLS impersonation active")
         else:
-            logger.info("🏠 Local environment detected. Using direct NSE API.")
+            logger.info("📡 Using standard requests (residential IP assumed)")
 
-    def _detect_cloud_env(self) -> bool:
-        """Detect if running in GitHub Actions or other cloud environments."""
-        return any([
-            os.getenv("GITHUB_ACTIONS") == "true",
-            os.getenv("CI") == "true",
-            os.getenv("CLOUD_ENV") == "true",
-        ])
-
-    def _get_headers(self) -> dict:
-        """Build request headers with rotating User-Agent."""
-        ua = self.USER_AGENTS[self._ua_index % len(self.USER_AGENTS)]
-        return {
-            "User-Agent": ua,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-            "Origin": "https://www.nseindia.com",
-            "X-Requested-With": "XMLHttpRequest",
-            "Connection": "keep-alive",
-            "Cache-Control": "no-cache",
-            "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
-
-    def _create_session(self) -> requests.Session:
-        """Create a fresh session with NSE cookies."""
-        session = requests.Session()
-        headers = self._get_headers()
-        session.headers.update(headers)
+    def _create_cffi_session(self):
+        """Create a curl_cffi session that impersonates Chrome."""
+        session = cffi_requests.Session(impersonate="chrome131")
 
         try:
-            logger.info("🔄 Creating new NSE session...")
-            response = session.get(
-                self.BASE_URL,
-                headers=headers,
-                timeout=15,
-                allow_redirects=True,
-            )
-            response.raise_for_status()
+            logger.info("🔄 Creating NSE session via curl_cffi (Chrome impersonation)...")
 
+            # Step 1: Visit homepage to get cookies
+            resp = session.get(self.BASE_URL, headers=self.HEADERS, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"⚠️ Homepage returned {resp.status_code}")
+
+            time.sleep(1)
+
+            # Step 2: Visit announcements page
             session.get(
                 f"{self.BASE_URL}/companies-listing/corporate-filings-announcements",
-                headers=headers,
+                headers=self.HEADERS,
                 timeout=15,
             )
 
             cookies = dict(session.cookies)
-            logger.info(f"✅ NSE session created. Cookies: {list(cookies.keys())}")
+            logger.info(f"✅ curl_cffi session created. Cookies: {list(cookies.keys())}")
             self._session_created_at = time.time()
-            self._ua_index += 1
-            self._nse_accessible = True
             return session
 
-        except requests.RequestException as e:
-            logger.warning(f"⚠️ Direct NSE session failed: {e}")
-            self._nse_accessible = False
+        except Exception as e:
+            logger.error(f"❌ curl_cffi session failed: {e}")
+            raise
+
+    def _create_requests_session(self):
+        """Create a standard requests session (for residential IPs)."""
+        session = requests.Session()
+        ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        headers = {**self.HEADERS, "User-Agent": ua}
+        session.headers.update(headers)
+
+        try:
+            logger.info("🔄 Creating NSE session via requests...")
+            resp = session.get(self.BASE_URL, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            session.get(
+                f"{self.BASE_URL}/companies-listing/corporate-filings-announcements",
+                timeout=15,
+            )
+            cookies = dict(session.cookies)
+            logger.info(f"✅ Requests session created. Cookies: {list(cookies.keys())}")
+            self._session_created_at = time.time()
+            return session
+        except Exception as e:
+            logger.error(f"❌ Requests session failed: {e}")
             raise
 
     def _ensure_session(self):
-        """Ensure we have a valid session."""
+        """Ensure we have a valid session, preferring curl_cffi."""
         elapsed = time.time() - self._session_created_at
-        if self.session is None or elapsed > self.SESSION_TTL:
-            try:
-                self.session = self._create_session()
-            except Exception:
-                self.session = requests.Session()
-                self.session.headers.update(self._get_headers())
-                self._nse_accessible = False
+
+        if self._use_cffi:
+            if self._cffi_session is None or elapsed > self.SESSION_TTL:
+                try:
+                    self._cffi_session = self._create_cffi_session()
+                except Exception:
+                    logger.warning("⚠️ curl_cffi session failed. Trying standard requests...")
+                    self._use_cffi = False
+                    self._requests_session = self._create_requests_session()
+        else:
+            if self._requests_session is None or elapsed > self.SESSION_TTL:
+                self._requests_session = self._create_requests_session()
+
+    def _get(self, url: str, params: dict = None, timeout: int = 15):
+        """Make a GET request using the active session."""
+        if self._use_cffi and self._cffi_session:
+            return self._cffi_session.get(url, params=params, headers=self.HEADERS, timeout=timeout)
+        elif self._requests_session:
+            return self._requests_session.get(url, params=params, timeout=timeout)
+        else:
+            raise RuntimeError("No active session")
 
     def _throttle(self):
         """Rate limiting between requests."""
@@ -139,248 +152,100 @@ class NSEScraper:
         if self._request_count % 5 == 0:
             time.sleep(2.0)
 
-    def _fetch_via_nse_rss(self, symbols: list = None) -> list:
+    def fetch_all_recent_announcements(self, from_date: str = None, to_date: str = None) -> list:
         """
-        Fetch announcements using NSE's RSS/Atom feed as fallback.
-        RSS feeds are often less restricted than JSON APIs.
+        Fetch ALL recent corporate announcements in one API call.
+        Most efficient approach — fetch all, then filter by watchlist.
         """
-        try:
-            rss_url = "https://www.nseindia.com/api/corporate-announcements?index=equities"
-            today = datetime.now()
+        self._ensure_session()
+
+        today = datetime.now()
+        if not from_date:
             from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
+        if not to_date:
             to_date = today.strftime("%d-%m-%Y")
-            rss_url += f"&from_date={from_date}&to_date={to_date}"
 
-            session = requests.Session()
-            session.headers.update(self._get_headers())
+        params = {
+            "index": "equities",
+            "from_date": from_date,
+            "to_date": to_date,
+        }
 
-            # Try getting cookies first
+        # Try with current session
+        for attempt in range(2):
             try:
-                session.get(self.BASE_URL, timeout=10)
-            except Exception:
-                pass
+                logger.info(f"📡 Fetching all announcements ({from_date} to {to_date}) [attempt {attempt + 1}]")
+                response = self._get(self.ANNOUNCEMENTS_API, params=params)
 
-            response = session.get(rss_url, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                announcements = data if isinstance(data, list) else data.get("data", [])
-                return announcements
-        except Exception as e:
-            logger.debug(f"RSS fallback failed: {e}")
+                if response.status_code in (401, 403):
+                    logger.warning(f"⚠️ HTTP {response.status_code}. Refreshing session...")
+                    self._session_created_at = 0  # Force refresh
+                    self._ensure_session()
+                    continue
 
-        return []
-
-    def _fetch_via_screener(self, symbol: str) -> list:
-        """
-        Fetch announcements from alternative public sources.
-        Uses publicly accessible APIs that mirror NSE data.
-        """
-        announcements = []
-
-        # Strategy 1: Try NSE with different headers (mobile user-agent)
-        try:
-            session = requests.Session()
-            mobile_headers = {
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-                "Accept": "application/json",
-                "Referer": "https://www.nseindia.com/",
-            }
-            session.headers.update(mobile_headers)
-
-            # Get cookies
-            session.get("https://www.nseindia.com", timeout=10)
-            time.sleep(0.5)
-
-            today = datetime.now()
-            from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
-            to_date = today.strftime("%d-%m-%Y")
-
-            response = session.get(
-                f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={symbol}&from_date={from_date}&to_date={to_date}",
-                timeout=15,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                announcements = data if isinstance(data, list) else data.get("data", [])
-                if announcements:
-                    logger.info(f"📋 Found {len(announcements)} via mobile-UA for {symbol}")
+                if response.status_code == 200:
+                    data = response.json()
+                    announcements = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
+                    logger.info(f"📋 Found {len(announcements)} total announcements")
                     return announcements
-        except Exception as e:
-            logger.debug(f"Mobile-UA strategy failed for {symbol}: {e}")
+                else:
+                    logger.warning(f"⚠️ Unexpected HTTP {response.status_code}")
 
-        return announcements
+            except Exception as e:
+                logger.warning(f"⚠️ Attempt {attempt + 1} failed: {e}")
+                self._session_created_at = 0
+                # If curl_cffi failed, try switching to standard requests
+                if self._use_cffi and attempt == 0:
+                    logger.info("🔄 Switching from curl_cffi to standard requests...")
+                    self._use_cffi = False
+                    try:
+                        self._requests_session = self._create_requests_session()
+                    except Exception:
+                        pass
+
+        logger.error("❌ All fetch attempts failed")
+        return []
 
     def fetch_announcements_by_symbol(self, symbol: str, from_date: str = None, to_date: str = None) -> list:
-        """
-        Fetch corporate announcements for a specific company symbol.
-        Automatically tries fallback strategies if direct API fails.
-        """
-        # If we know NSE is accessible (local machine), use direct API
-        if self._nse_accessible is not False:
-            result = self._fetch_direct(symbol, from_date, to_date)
-            if result is not None:
-                return result
+        """Fetch announcements for a specific company symbol."""
+        self._ensure_session()
+        self._throttle()
 
-        # Fallback strategies for cloud environments
-        result = self._fetch_via_screener(symbol)
-        if result:
-            return result
+        today = datetime.now()
+        if not from_date:
+            from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
+        if not to_date:
+            to_date = today.strftime("%d-%m-%Y")
 
-        return []
+        params = {
+            "index": "equities",
+            "symbol": symbol.upper(),
+            "from_date": from_date,
+            "to_date": to_date,
+        }
 
-    def _fetch_direct(self, symbol: str, from_date: str = None, to_date: str = None) -> Optional[list]:
-        """Direct NSE API fetch (works from residential IPs)."""
         try:
-            self._ensure_session()
-            self._throttle()
-
-            today = datetime.now()
-            if not from_date:
-                from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
-            if not to_date:
-                to_date = today.strftime("%d-%m-%Y")
-
-            params = {
-                "index": "equities",
-                "symbol": symbol.upper(),
-                "from_date": from_date,
-                "to_date": to_date,
-            }
-
             logger.info(f"📡 Fetching announcements for {symbol} ({from_date} to {to_date})")
-            response = self.session.get(self.ANNOUNCEMENTS_API, params=params, timeout=15)
+            response = self._get(self.ANNOUNCEMENTS_API, params=params)
 
             if response.status_code in (401, 403):
-                logger.warning(f"⚠️ NSE returned {response.status_code}. Trying session refresh...")
-                try:
-                    self.session = self._create_session()
-                    response = self.session.get(self.ANNOUNCEMENTS_API, params=params, timeout=15)
-                except Exception:
-                    self._nse_accessible = False
-                    return None
+                logger.warning(f"⚠️ HTTP {response.status_code}. Refreshing session...")
+                self._session_created_at = 0
+                self._ensure_session()
+                response = self._get(self.ANNOUNCEMENTS_API, params=params)
 
             if response.status_code != 200:
-                self._nse_accessible = False
-                return None
+                logger.warning(f"⚠️ HTTP {response.status_code} for {symbol}")
+                return []
 
             data = response.json()
             announcements = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
             logger.info(f"📋 Found {len(announcements)} announcements for {symbol}")
             return announcements
 
-        except requests.exceptions.JSONDecodeError:
-            logger.warning(f"⚠️ Non-JSON response for {symbol}")
-            return None
-        except requests.RequestException as e:
-            logger.warning(f"⚠️ Direct fetch failed for {symbol}: {e}")
-            self._nse_accessible = False
-            return None
-
-    def fetch_all_recent_announcements(self, from_date: str = None, to_date: str = None) -> list:
-        """
-        Fetch ALL recent corporate announcements.
-        This is the most efficient approach for cloud environments —
-        one API call to get all filings, then filter by watchlist.
-        """
-        today = datetime.now()
-        if not from_date:
-            from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
-        if not to_date:
-            to_date = today.strftime("%d-%m-%Y")
-
-        # Try direct API first
-        if self._nse_accessible is not False:
-            try:
-                self._ensure_session()
-                params = {
-                    "index": "equities",
-                    "from_date": from_date,
-                    "to_date": to_date,
-                }
-                logger.info(f"📡 Fetching all announcements ({from_date} to {to_date})")
-                response = self.session.get(self.ANNOUNCEMENTS_API, params=params, timeout=15)
-
-                if response.status_code == 200:
-                    data = response.json()
-                    announcements = data if isinstance(data, list) else data.get("data", [])
-                    logger.info(f"📋 Found {len(announcements)} total announcements")
-                    return announcements
-            except Exception as e:
-                logger.warning(f"⚠️ Bulk fetch failed: {e}")
-                self._nse_accessible = False
-
-        # Fallback: RSS feed
-        announcements = self._fetch_via_nse_rss()
-        if announcements:
-            logger.info(f"📋 Found {len(announcements)} via RSS fallback")
-            return announcements
-
-        # Ultimate fallback: Headless browser (Playwright)
-        announcements = self._fetch_via_playwright(from_date, to_date)
-        if announcements:
-            logger.info(f"📋 Found {len(announcements)} via Playwright browser")
-            return announcements
-
-        logger.error("❌ All fetch strategies failed!")
-        return []
-
-    def _fetch_via_playwright(self, from_date: str = None, to_date: str = None) -> list:
-        """
-        Ultimate fallback: Use a real headless browser to fetch NSE data.
-        This bypasses all IP-based blocking because it renders the page
-        like a real browser, including JavaScript execution.
-        """
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            logger.warning("⚠️ Playwright not installed. Skipping browser fallback.")
-            return []
-
-        today = datetime.now()
-        if not from_date:
-            from_date = (today - timedelta(days=1)).strftime("%d-%m-%Y")
-        if not to_date:
-            to_date = today.strftime("%d-%m-%Y")
-
-        logger.info(f"🌐 Launching headless browser for NSE ({from_date} to {to_date})...")
-
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent=self.USER_AGENTS[0],
-                    viewport={"width": 1920, "height": 1080},
-                    locale="en-IN",
-                )
-                page = context.new_page()
-
-                # Step 1: Visit homepage to establish session
-                page.goto("https://www.nseindia.com", wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
-
-                # Step 2: Intercept the API response
-                api_url = (
-                    f"https://www.nseindia.com/api/corporate-announcements"
-                    f"?index=equities&from_date={from_date}&to_date={to_date}"
-                )
-
-                response = page.request.get(api_url)
-
-                if response.status == 200:
-                    data = response.json()
-                    announcements = data if isinstance(data, list) else data.get("data", [])
-                    logger.info(f"🌐 Playwright fetched {len(announcements)} announcements")
-                    browser.close()
-                    return announcements
-                else:
-                    logger.warning(f"⚠️ Playwright got HTTP {response.status}")
-
-                browser.close()
-
         except Exception as e:
-            logger.error(f"❌ Playwright fetch failed: {e}")
-
-        return []
+            logger.error(f"❌ Failed to fetch {symbol}: {e}")
+            return []
 
     def filter_by_watchlist(self, announcements: list, watchlist_symbols: list) -> list:
         """Filter announcements to only include watchlist companies."""
@@ -398,9 +263,7 @@ class NSEScraper:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
     scraper = NSEScraper()
-    results = scraper.fetch_announcements_by_symbol("RELIANCE")
-    for r in results[:3]:
-        print(f"\n--- Announcement ---")
-        print(f"  Company: {r.get('symbol', 'N/A')}")
-        print(f"  Subject: {r.get('desc', r.get('subject', 'N/A'))}")
-        print(f"  Date:    {r.get('an_dt', r.get('date', 'N/A'))}")
+    results = scraper.fetch_all_recent_announcements()
+    print(f"\nTotal: {len(results)} announcements")
+    for r in results[:5]:
+        print(f"  {r.get('symbol', 'N/A'):>12} | {r.get('desc', 'N/A')[:60]}")

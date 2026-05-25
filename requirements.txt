@@ -4,6 +4,9 @@
 # HTTP requests with session management
 requests>=2.31.0
 
+# Chrome TLS fingerprint impersonation (bypasses Akamai Bot Manager on NSE)
+curl_cffi>=0.7.0
+
 # Twilio SDK for WhatsApp messaging
 twilio>=9.0.0
 
