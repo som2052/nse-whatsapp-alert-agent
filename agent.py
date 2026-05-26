@@ -144,9 +144,10 @@ class NSEAlertAgent:
     def check_and_alert(self) -> int:
         """
         Run one check cycle:
-        1. Fetch announcements for each watchlist company
-        2. Filter out already-sent alerts
-        3. Summarize and send new alerts via WhatsApp
+        1. Bulk-fetch all announcements from both SME + equities indices
+        2. Filter by watchlist
+        3. Filter out already-sent alerts
+        4. Summarize and send new alerts via WhatsApp
 
         Returns:
             Number of new alerts sent
@@ -157,22 +158,41 @@ class NSEAlertAgent:
         new_alerts_sent = 0
         all_new_announcements = []
 
-        # Strategy: Fetch per-symbol for targeted results
-        for company in self.companies:
-            symbol = company["symbol"]
-            try:
-                announcements = self.scraper.fetch_announcements_by_symbol(symbol)
-
-                for ann in announcements:
+        # Strategy: Bulk fetch (2 API calls for both indices) then filter by watchlist
+        try:
+            all_announcements = self.scraper.fetch_all_recent_announcements()
+            if all_announcements:
+                matched = self.scraper.filter_by_watchlist(all_announcements, self.symbols)
+                for ann in matched:
                     if not self.db.is_already_sent(ann):
                         all_new_announcements.append(ann)
-
-                # Small delay between companies to be respectful to NSE
-                time.sleep(1)
-
-            except Exception as e:
-                logger.error(f"❌ Error fetching {symbol}: {e}")
-                continue
+                logger.info(f"📊 Bulk: {len(all_announcements)} total → {len(matched)} matched → {len(all_new_announcements)} new")
+            else:
+                logger.warning("⚠️ Bulk fetch returned empty. Trying per-symbol fallback...")
+                for company in self.companies:
+                    symbol = company["symbol"]
+                    try:
+                        announcements = self.scraper.fetch_announcements_by_symbol(symbol)
+                        for ann in announcements:
+                            if not self.db.is_already_sent(ann):
+                                all_new_announcements.append(ann)
+                        time.sleep(1)
+                    except Exception as e:
+                        logger.error(f"❌ Error fetching {symbol}: {e}")
+                        continue
+        except Exception as e:
+            logger.error(f"❌ Bulk fetch error: {e}. Trying per-symbol fallback...")
+            for company in self.companies:
+                symbol = company["symbol"]
+                try:
+                    announcements = self.scraper.fetch_announcements_by_symbol(symbol)
+                    for ann in announcements:
+                        if not self.db.is_already_sent(ann):
+                            all_new_announcements.append(ann)
+                    time.sleep(1)
+                except Exception as e2:
+                    logger.error(f"❌ Error fetching {symbol}: {e2}")
+                    continue
 
         if not all_new_announcements:
             logger.info(f"📭 No new announcements in cycle #{self.cycle_count}")
