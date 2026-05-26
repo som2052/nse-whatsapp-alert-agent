@@ -154,8 +154,8 @@ class NSEScraper:
 
     def fetch_all_recent_announcements(self, from_date: str = None, to_date: str = None) -> list:
         """
-        Fetch ALL recent corporate announcements in one API call.
-        Most efficient approach — fetch all, then filter by watchlist.
+        Fetch ALL recent corporate announcements from BOTH equities and SME indices.
+        SME companies are listed under index=sme, not index=equities!
         """
         self._ensure_session()
 
@@ -165,49 +165,59 @@ class NSEScraper:
         if not to_date:
             to_date = today.strftime("%d-%m-%Y")
 
-        params = {
-            "index": "equities",
-            "from_date": from_date,
-            "to_date": to_date,
-        }
+        all_announcements = []
 
-        # Try with current session
-        for attempt in range(2):
-            try:
-                logger.info(f"📡 Fetching all announcements ({from_date} to {to_date}) [attempt {attempt + 1}]")
-                response = self._get(self.ANNOUNCEMENTS_API, params=params)
+        # Fetch from BOTH indices — SME companies are on 'sme', large-caps on 'equities'
+        for index_name in ["sme", "equities"]:
+            params = {
+                "index": index_name,
+                "from_date": from_date,
+                "to_date": to_date,
+            }
 
-                if response.status_code in (401, 403):
-                    logger.warning(f"⚠️ HTTP {response.status_code}. Refreshing session...")
-                    self._session_created_at = 0  # Force refresh
-                    self._ensure_session()
-                    continue
+            for attempt in range(2):
+                try:
+                    logger.info(f"📡 Fetching {index_name} announcements ({from_date} to {to_date}) [attempt {attempt + 1}]")
+                    response = self._get(self.ANNOUNCEMENTS_API, params=params)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    announcements = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
-                    logger.info(f"📋 Found {len(announcements)} total announcements")
-                    return announcements
-                else:
-                    logger.warning(f"⚠️ Unexpected HTTP {response.status_code}")
+                    if response.status_code in (401, 403):
+                        logger.warning(f"⚠️ HTTP {response.status_code} for {index_name}. Refreshing session...")
+                        self._session_created_at = 0
+                        self._ensure_session()
+                        continue
 
-            except Exception as e:
-                logger.warning(f"⚠️ Attempt {attempt + 1} failed: {e}")
-                self._session_created_at = 0
-                # If curl_cffi failed, try switching to standard requests
-                if self._use_cffi and attempt == 0:
-                    logger.info("🔄 Switching from curl_cffi to standard requests...")
-                    self._use_cffi = False
-                    try:
-                        self._requests_session = self._create_requests_session()
-                    except Exception:
-                        pass
+                    if response.status_code == 200:
+                        data = response.json()
+                        announcements = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
+                        logger.info(f"📋 Found {len(announcements)} {index_name} announcements")
+                        all_announcements.extend(announcements)
+                        break
+                    else:
+                        logger.warning(f"⚠️ HTTP {response.status_code} for {index_name}")
 
-        logger.error("❌ All fetch attempts failed")
-        return []
+                except Exception as e:
+                    logger.warning(f"⚠️ {index_name} attempt {attempt + 1} failed: {e}")
+                    self._session_created_at = 0
+                    if self._use_cffi and attempt == 0:
+                        logger.info("🔄 Switching from curl_cffi to standard requests...")
+                        self._use_cffi = False
+                        try:
+                            self._requests_session = self._create_requests_session()
+                        except Exception:
+                            pass
+
+            import time as _time
+            _time.sleep(1)  # Brief pause between index fetches
+
+        if all_announcements:
+            logger.info(f"📋 Total across all indices: {len(all_announcements)} announcements")
+        else:
+            logger.error("❌ All fetch attempts failed for all indices")
+
+        return all_announcements
 
     def fetch_announcements_by_symbol(self, symbol: str, from_date: str = None, to_date: str = None) -> list:
-        """Fetch announcements for a specific company symbol."""
+        """Fetch announcements for a specific company symbol (checks both SME and equities)."""
         self._ensure_session()
         self._throttle()
 
@@ -217,35 +227,38 @@ class NSEScraper:
         if not to_date:
             to_date = today.strftime("%d-%m-%Y")
 
-        params = {
-            "index": "equities",
-            "symbol": symbol.upper(),
-            "from_date": from_date,
-            "to_date": to_date,
-        }
+        # Try SME index first (since user's companies are SME), then equities
+        for index_name in ["sme", "equities"]:
+            params = {
+                "index": index_name,
+                "symbol": symbol.upper(),
+                "from_date": from_date,
+                "to_date": to_date,
+            }
 
-        try:
-            logger.info(f"📡 Fetching announcements for {symbol} ({from_date} to {to_date})")
-            response = self._get(self.ANNOUNCEMENTS_API, params=params)
-
-            if response.status_code in (401, 403):
-                logger.warning(f"⚠️ HTTP {response.status_code}. Refreshing session...")
-                self._session_created_at = 0
-                self._ensure_session()
+            try:
+                logger.info(f"📡 Fetching {index_name} announcements for {symbol} ({from_date} to {to_date})")
                 response = self._get(self.ANNOUNCEMENTS_API, params=params)
 
-            if response.status_code != 200:
-                logger.warning(f"⚠️ HTTP {response.status_code} for {symbol}")
-                return []
+                if response.status_code in (401, 403):
+                    logger.warning(f"⚠️ HTTP {response.status_code}. Refreshing session...")
+                    self._session_created_at = 0
+                    self._ensure_session()
+                    response = self._get(self.ANNOUNCEMENTS_API, params=params)
 
-            data = response.json()
-            announcements = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
-            logger.info(f"📋 Found {len(announcements)} announcements for {symbol}")
-            return announcements
+                if response.status_code == 200:
+                    data = response.json()
+                    announcements = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
+                    if announcements:
+                        logger.info(f"📋 Found {len(announcements)} announcements for {symbol} on {index_name}")
+                        return announcements
 
-        except Exception as e:
-            logger.error(f"❌ Failed to fetch {symbol}: {e}")
-            return []
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch {symbol} from {index_name}: {e}")
+                continue
+
+        logger.info(f"📭 No announcements for {symbol} on any index")
+        return []
 
     def filter_by_watchlist(self, announcements: list, watchlist_symbols: list) -> list:
         """Filter announcements to only include watchlist companies."""
